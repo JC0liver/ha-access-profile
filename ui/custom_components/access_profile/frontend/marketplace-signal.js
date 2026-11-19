@@ -76,11 +76,15 @@
           return `<div class="ap-reason"><div>${esc(r.text)}${r.count_text ? ` (${esc(r.count_text)})` : ""}</div>
             <div class="lvl">${esc(rl.emoji)} ${esc(rl.label)}</div>${links || more ? `<ul>${links}${more}</ul>` : ""}</div>`;
         }).join("")
-      : `<p>No flags found in this release.</p>`;
+      : `<p>The scan found none of the patterns it looks for: no shell commands, hidden code, web pages without
+         login, dashboard JavaScript, certificate checks turned off, access to logins or secrets, or vulnerable pinned packages.</p>`;
     const note = p.author_note ? `<div class="ap-note"><b>Author's explanation</b>${esc(p.author_note.text)}
       ${p.author_note.sample ? `<small>${esc(p.author_note.source)}</small>` : ""}</div>` : "";
     const hosts = p.hosts.length ? `<p>Contacts: ${p.hosts.map(esc).join(", ")}</p>` : "";
-    return `<p>${esc(l.meaning)} The level is set by the most serious finding.</p>${reasons}${note}${hosts}
+    const lead = p.reasons.length
+      ? `${esc(l.meaning)} The level comes from the most serious finding below.`
+      : `${esc(l.meaning)}`;
+    return `<p>${lead}</p>${reasons}${note}${hosts}
       <div class="ap-footer">${esc(data.footer)} Checked release ${esc(p.tag)}.</div>`;
   }
 

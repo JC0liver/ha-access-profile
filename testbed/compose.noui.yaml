@@ -1,0 +1,8 @@
+# Override used by start.ps1 only while ../ui does not exist yet.
+# Drops the two UI mounts so the base instance can run and be onboarded.
+services:
+  homeassistant:
+    volumes: !override
+      - type: bind
+        source: ./config
+        target: /config

@@ -1,0 +1,13 @@
+# Downloaded third-party code and catalog data: untrusted, never committed
+untrusted/
+# Generated scan outputs
+prototype/**/scan-results*.json
+prototype/**/*.log
+prototype/**/dirs.txt
+ui/data/
+# Test instance state and credentials
+testbed/config/
+testbed/.venv/
+testbed/.secrets.env
+testbed/screenshots/*.png
+__pycache__/

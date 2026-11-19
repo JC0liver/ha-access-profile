@@ -1,0 +1,13 @@
+{
+  "domain": "access_profile",
+  "name": "Access profile (mockup)",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "panel_custom"],
+  "documentation": "https://www.home-assistant.io",
+  "iot_class": "calculated",
+  "integration_type": "service",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

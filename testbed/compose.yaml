@@ -1,0 +1,31 @@
+# Throwaway Home Assistant testbed for the "Access profile" UI prototype.
+# Localhost only, no host networking, not privileged, pinned image.
+name: ap-testbed
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:2026.11.2
+    container_name: ap-testbed
+    restart: "no"
+    ports:
+      - "127.0.0.1:8124:8123"
+    environment:
+      - TZ=UTC
+    volumes:
+      - type: bind
+        source: ./config
+        target: /config
+      # Contract with the UI agent: both read-only. create_host_path=false so
+      # Docker never creates empty folders under ../ui if they are missing.
+      - type: bind
+        source: ../ui/custom_components/access_profile
+        target: /config/custom_components/access_profile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../ui/data
+        target: /config/access_profile
+        read_only: true
+        bind:
+          create_host_path: false

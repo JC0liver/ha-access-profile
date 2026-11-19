@@ -1,0 +1,337 @@
+"""Prototype static security checks for a HACS integration repository.
+
+Reads files only (ast.parse, byte reads). Never imports or runs scanned code.
+Usage: python -I scan.py <repo_dir> [<repo_dir> ...] > out.json
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+import sys
+from pathlib import Path
+
+BINARY_MAGIC = {
+    b"\x7fELF": "ELF",
+    b"MZ": "PE",
+    b"\xcf\xfa\xed\xfe": "Mach-O",
+    b"\xfe\xed\xfa\xcf": "Mach-O",
+    b"PK\x03\x04": "zip",
+}
+# v2: ".bin" dropped (data files); executable formats and archives only.
+BINARY_EXT = {".so", ".pyd", ".dll", ".exe", ".dylib", ".whl", ".zip", ".pyc", ".jar"}
+B64_RE = re.compile(r"^[A-Za-z0-9+/=]{300,}$")
+HEX_RE = re.compile(r"^[0-9A-Fa-f]+$")
+# v2: base64 that is plainly an image (PNG, JPEG, GIF, SVG, WebP) is not obfuscation.
+IMAGE_B64_PREFIXES = ("iVBORw0KGgo", "/9j/", "R0lGOD", "PD94bWwg", "PHN2Zy", "UklGR")
+URL_RE = re.compile(r"^(https?|wss?)://([^/:\s]+)")
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "example.com", "github.com",
+               "www.home-assistant.io", "home-assistant.io", "developers.home-assistant.io"}
+
+SUBPROCESS_CALLS = {
+    "subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output",
+    "subprocess.Popen", "subprocess.getoutput", "subprocess.getstatusoutput",
+    "os.system", "os.popen", "os.execv", "os.execvp", "os.spawnl", "os.spawnv",
+    "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
+}
+DESERIALISE_CALLS = {"pickle.load", "pickle.loads", "marshal.load", "marshal.loads",
+                     "dill.load", "dill.loads", "shelve.open", "yaml.unsafe_load",
+                     "jsonpickle.decode"}
+PKG_INSTALL_CALLS = {"homeassistant.util.package.install_package", "install_package",
+                     "pip.main", "pip._internal.main"}
+# v4 (from the Marshal comparison): HA's own requirement installer, called at run time
+PKG_INSTALL_SHORT = {"install_package", "async_process_requirements", "async_get_integration_with_requirements"}
+# v4: Home Assistant auth API. Reading users -> auth_read; changing users/tokens or private internals -> auth_write
+AUTH_READ_ATTRS = {"async_get_user", "async_get_users", "async_get_owner", "get_auth_provider",
+                   "async_get_refresh_token", "async_get_refresh_token_by_token", "auth_providers"}
+AUTH_WRITE_ATTRS = {"async_create_user", "async_create_system_user", "async_update_user", "async_remove_user",
+                    "async_create_refresh_token", "async_create_access_token", "async_remove_refresh_token",
+                    "async_activate_user", "async_deactivate_user", "_providers", "_store", "_mfa_modules"}
+# v4: names of Home Assistant's secret files and tokens
+SECRET_NAMES = ("secrets.yaml", "core.config_entries", "auth_provider.homeassistant", ".storage/auth",
+                "SUPERVISOR_TOKEN", "HASSIO_TOKEN")
+
+
+def dotted(node: ast.AST) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+class Visitor(ast.NodeVisitor):
+    def __init__(self, rel: str, aliases: dict[str, str]) -> None:
+        self.rel = rel
+        self.aliases = aliases
+        self.findings: list[dict] = []
+        self.hosts: set[str] = set()
+        self.view_stack: list[bool] = []
+        self.cert_required = False
+        self.has_download = False
+
+    def add(self, check: str, node: ast.AST, detail: str, sev: str) -> None:
+        self.findings.append({"check": check, "sev": sev, "file": self.rel,
+                              "line": getattr(node, "lineno", 0), "detail": detail})
+
+    def resolve(self, name: str) -> str:
+        head, _, rest = name.partition(".")
+        if head in self.aliases:
+            return self.aliases[head] + ("." + rest if rest else "")
+        return name
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        bases = {self.resolve(dotted(b)).split(".")[-1] for b in node.bases}
+        if any(b.endswith("SafeLoader") for b in bases):
+            SAFE_LOADERS.add(node.name)
+        is_view = "HomeAssistantView" in bases
+        if is_view:
+            unauth = False
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    for t in stmt.targets:
+                        if (isinstance(t, ast.Name) and t.id == "requires_auth"
+                                and isinstance(stmt.value, ast.Constant)
+                                and stmt.value.value is False):
+                            unauth = True
+            src = ast.unparse(node)
+            self_auth = any(k in src for k in ("KEY_AUTHENTICATED", "hass_user", "hass_refresh_token_id"))
+            if unauth and self_auth:
+                # v2: requires_auth = False but the handler checks the login itself
+                self.add("http_view_selfauth", node, f"class {node.name}: checks login in handler", "low")
+            elif unauth and self._static_only(node, src):
+                # v3: only GET/HEAD, returns files or file contents, never reads request input
+                self.add("http_view_static", node, f"class {node.name}: static files without login", "low")
+            elif unauth:
+                self.add("http_view_no_auth", node, f"class {node.name}: requires_auth = False", "high")
+            else:
+                self.add("http_view", node, f"class {node.name}", "info")
+        self.view_stack.append(is_view)
+        self.generic_visit(node)
+        self.view_stack.pop()
+
+    @staticmethod
+    def _static_only(node: ast.ClassDef, src: str) -> bool:
+        methods = {n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if methods & {"post", "put", "patch", "delete"}:
+            return False
+        if any(k in src for k in ("request.query", "request.post", "request.json", "request.read",
+                                  "request.text", "request.match_info", "request.headers", "request.cookies",
+                                  "WebSocketResponse", "ClientSession", "get_clientsession")):
+            return False
+        return any(k in src for k in ("FileResponse", "read_text", "read_bytes"))
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = self.resolve(dotted(node.func))
+        short = name.split(".")[-1]
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+
+        if short == "chmod" and len(node.args) >= 2:
+            mode = node.args[-1]
+            mode_src = ast.unparse(mode)
+            exec_bit = any(k in mode_src for k in ("S_IEXEC", "S_IXUSR", "S_IXGRP", "S_IXOTH")) or (
+                isinstance(mode, ast.Constant) and isinstance(mode.value, int) and mode.value & 0o111)
+            target = ast.unparse(node.args[0]).lower()
+            if exec_bit and self.has_download and "dir" not in target and "folder" not in target:
+                # v3: file made executable at runtime in a file that also downloads = download-and-run
+                self.add("make_executable", node, f"{name}({mode_src})", "high")
+            elif exec_bit:
+                self.add("chmod_exec", node, f"{name}({mode_src}) (no download in file, or a directory)", "info")
+
+        if name in SUBPROCESS_CALLS:
+            shell = isinstance(kw.get("shell"), ast.Constant) and kw["shell"].value is True
+            sev = "high" if shell or name.endswith(("_shell", "system", "popen")) else "medium"
+            first = node.args[0] if node.args else None
+            fixed = (not shell and sev != "high" and first is not None and (
+                (isinstance(first, (ast.List, ast.Tuple)) and first.elts
+                 and isinstance(first.elts[0], ast.Constant))
+                or (name == "asyncio.create_subprocess_exec" and isinstance(first, ast.Constant))))
+            if fixed:
+                # v2: argument list starting with a literal program name, no shell
+                prog = first.elts[0].value if isinstance(first, (ast.List, ast.Tuple)) else first.value
+                self.add("subprocess_fixed", node, f"{name} -> {prog}", "low")
+            else:
+                self.add("subprocess", node, name + (" shell=True" if shell else ""), sev)
+        if name in {"eval", "exec", "compile"} or (name == "__import__" and node.args
+                                                   and not isinstance(node.args[0], ast.Constant)):
+            self.add("dynamic_code", node, name, "high")
+        if short == "eval" and name != "eval":
+            self.add("dynamic_code", node, f"{name}() (embedded interpreter)", "medium")
+        if name in {"importlib.import_module"} and node.args and not isinstance(node.args[0], ast.Constant):
+            self.add("dynamic_import", node, name + "(non-constant)", "low")
+        if name in DESERIALISE_CALLS:
+            self.add("unsafe_deserialise", node, name, "high")
+        if name == "yaml.load":
+            loader = kw.get("Loader") or (node.args[1] if len(node.args) > 1 else None)
+            lname = dotted(loader) if loader is not None else ""
+            if not (lname.endswith(("SafeLoader", "BaseLoader")) or lname.split(".")[-1] in SAFE_LOADERS):
+                self.add("unsafe_deserialise", node, f"yaml.load Loader={lname or 'default'}", "high")
+        # TLS verification disabled
+        for key in ("verify", "verify_ssl", "ssl"):
+            v = kw.get(key)
+            if isinstance(v, ast.Constant) and v.value is False:
+                self.add("tls_verify_off", node, f"{short}({key}=False)", "medium")
+        if name.endswith("_create_unverified_context"):
+            self.add("tls_verify_off", node, name, "medium")
+        if name.endswith("webhook.async_register") or short == "async_register_webhook":
+            self.add("webhook", node, name, "info")
+        if name in PKG_INSTALL_CALLS or short in PKG_INSTALL_SHORT:
+            self.add("runtime_pkg_install", node, name, "high")
+        if name.endswith("config_entries.async_entries") and not node.args and not node.keywords:
+            # v4: no domain given = every integration's config entries (credentials included)
+            self.add("all_config_entries", node, name + "()", "low")
+        if short == "add_extra_js_url" or (short == "async_create_item" and "res_type" in ast.unparse(node)):
+            text = ast.unparse(node)
+            if "http://" in text or "https://" in text or "data:" in text:
+                self.add("frontend_injection", node, f"{name} (remote or inline script)", "medium")
+            else:
+                # v2: the integration's own bundled card/panel served from a local path
+                self.add("frontend_card", node, name, "low")
+        if name == "bytes.fromhex" and node.args and "b64decode" in ast.unparse(node.args[0]):
+            self.add("obfuscation", node, "bytes.fromhex(b64decode(...)) string hiding", "medium")
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr == "CERT_NONE":
+            self.add("tls_verify_off", node, dotted(node), "medium")
+        owner = dotted(node.value)
+        if owner == "auth" or owner.endswith(".auth"):  # v4: hass.auth.*
+            if node.attr in AUTH_WRITE_ATTRS:
+                self.add("auth_write", node, f"{owner}.{node.attr}", "high")
+            elif node.attr in AUTH_READ_ATTRS:
+                self.add("auth_read", node, f"{owner}.{node.attr}", "low")
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for t in node.targets:
+            if (isinstance(t, ast.Attribute) and t.attr == "check_hostname"
+                    and isinstance(node.value, ast.Constant) and node.value.value is False
+                    and not self.cert_required):  # v2: pinned CA / PSK keeps verification on
+                self.add("tls_verify_off", node, "check_hostname = False", "medium")
+        self.generic_visit(node)
+
+    def visit_Constant(self, node: ast.Constant) -> None:
+        if isinstance(node.value, str):
+            s = node.value.strip()
+            if (B64_RE.match(s) and not s.startswith(IMAGE_B64_PREFIXES)
+                    and not HEX_RE.match(s)):  # v3: hex constants (crypto primes, keys) are not base64
+                self.add("obfuscation", node, f"base64-like literal, {len(s)} chars", "medium")
+            if len(s) < 200:  # v4: secret files / private storage named in code
+                if any(k in s for k in SECRET_NAMES):
+                    self.add("secret_files", node, s[:60], "high")
+                elif s == ".storage" or s.startswith((".storage/", "/config/.storage")):
+                    self.add("private_storage", node, s[:60], "low")
+            m = URL_RE.match(s)
+            if m:
+                host = m.group(2).lower()
+                if host not in LOCAL_HOSTS and "{" not in host and "%" not in host:
+                    self.hosts.add(host)
+
+
+SAFE_LOADERS: set[str] = set()
+# Conventional Home Assistant short aliases (er = entity_registry, cv = config_validation, ...)
+HA_ALIASES = {"ar", "cr", "dr", "er", "fr", "ir", "lr", "cv", "dt", "vol", "pd"}
+
+
+def short_alias_count(tree: ast.AST) -> int:
+    n = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            n += sum(1 for a in node.names
+                     if a.asname and len(a.asname) <= 2 and a.asname not in HA_ALIASES)
+    return n
+
+
+def collect_aliases(tree: ast.AST) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                aliases[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for a in node.names:
+                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+    return aliases
+
+
+def scan_repo(repo: Path) -> dict:
+    cc = repo / "custom_components"
+    domains = [d for d in cc.iterdir() if d.is_dir()] if cc.is_dir() else []
+    if not domains and (repo / "manifest.json").is_file():
+        domains = [repo]  # v4: hacs.json content_in_root, the integration lives at the repo root
+    result: dict = {"repo": repo.name, "domains": [d.name for d in domains], "findings": [],
+                    "hosts": [], "manifest": {}, "py_files": 0, "py_lines": 0, "parse_errors": []}
+    hosts: set[str] = set()
+    SAFE_LOADERS.clear()
+    for d in domains:  # pre-pass: local yaml.SafeLoader subclasses
+        for f in (x for x in d.rglob("*.py") if ".git" not in x.relative_to(d).parts):
+            try:
+                t = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError:
+                continue
+            for n in ast.walk(t):
+                if isinstance(n, ast.ClassDef) and any(dotted(x).endswith("SafeLoader") for x in n.bases):
+                    SAFE_LOADERS.add(n.name)
+    for d in domains:
+        mf = d / "manifest.json"
+        if mf.is_file():
+            try:
+                m = json.loads(mf.read_text(encoding="utf-8"))
+                result["manifest"][d.name] = {k: m.get(k) for k in
+                                              ("version", "requirements", "iot_class", "dependencies",
+                                               "after_dependencies", "codeowners")}
+            except ValueError as err:
+                result["parse_errors"].append(f"{mf}: {err}")
+        for f in d.rglob("*"):
+            if not f.is_file() or ".git" in f.relative_to(d).parts:
+                continue
+            rel = f.relative_to(repo).as_posix()
+            head = f.open("rb").read(4)
+            kind = next((v for k, v in BINARY_MAGIC.items() if head.startswith(k)), None)
+            if f.suffix.lower() == ".pyc":
+                # v3: only unchecked hash-based .pyc (flags == 3) is loaded without checking the source
+                hdr = f.open("rb").read(8)
+                flags = int.from_bytes(hdr[4:8], "little") if len(hdr) == 8 else -1
+                if flags == 3:
+                    result["findings"].append({"check": "bundled_binary", "sev": "high", "file": rel,
+                                               "line": 0, "detail": ".pyc (unchecked hash, runs without source)"})
+                else:
+                    result["findings"].append({"check": "pyc_cache", "sev": "info", "file": rel,
+                                               "line": 0, "detail": f".pyc cache committed (flags {flags})"})
+            elif f.suffix.lower() in BINARY_EXT or kind:
+                result["findings"].append({"check": "bundled_binary", "sev": "high", "file": rel,
+                                           "line": 0, "detail": kind or f.suffix})
+            if f.suffix != ".py":
+                continue
+            # v2: test code shipped inside the integration is never loaded by Home Assistant
+            if {"tests", "test"} & set(f.relative_to(d).parts[:-1]) or f.name.startswith("test_"):
+                continue
+            src = f.read_text(encoding="utf-8", errors="replace")
+            result["py_files"] += 1
+            result["py_lines"] += src.count("\n") + 1
+            # v2: the "line over 2000 chars" rule was dropped (inline images, generated protobuf, data tables)
+            try:
+                tree = ast.parse(src, filename=rel)
+            except SyntaxError as err:
+                result["parse_errors"].append(f"{rel}: {err}")
+                continue
+            if (sa := short_alias_count(tree)) >= 5:
+                result["findings"].append({"check": "obfuscation", "sev": "medium", "file": rel,
+                                           "line": 0, "detail": f"{sa} imports renamed to 1-2 letters"})
+            v = Visitor(rel, collect_aliases(tree))
+            v.cert_required = "CERT_REQUIRED" in src
+            v.has_download = any(k in src for k in ("requests.get", "urlopen", "urlretrieve", "ClientSession",
+                                                    "get_clientsession", "httpx."))
+            v.visit(tree)
+            result["findings"].extend(v.findings)
+            hosts |= v.hosts
+    result["hosts"] = sorted(hosts)
+    return result
+
+
+if __name__ == "__main__":
+    out = [scan_repo(Path(p)) for p in sys.argv[1:]]
+    json.dump(out, sys.stdout, indent=1)

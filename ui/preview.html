@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access profile preview</title>
+<style>
+  /* A small subset of Home Assistant's default theme variables, light and dark. */
+  :root {
+    --primary-color: #009ac7; --text-primary-color: #ffffff;
+    --primary-background-color: #fafafa; --secondary-background-color: #e5e5e5;
+    --card-background-color: #ffffff; --primary-text-color: #141414; --secondary-text-color: #5e5e5e;
+    --divider-color: rgba(0, 0, 0, .12); --app-header-background-color: #fafafa; --app-header-text-color: #141414;
+    --app-header-border-bottom: 1px solid rgba(0, 0, 0, .12);
+    --label-badge-green: #0da035; --label-badge-blue: #039be5; --label-badge-red: #df4c1e; --orange-color: #ff9800;
+    --ha-font-family-body: Roboto, "Segoe UI", system-ui, sans-serif;
+  }
+  :root[data-theme="dark"] {
+    --primary-background-color: #111111; --secondary-background-color: #282828;
+    --card-background-color: #1c1c1c; --primary-text-color: #e1e1e1; --secondary-text-color: #9b9b9b;
+    --divider-color: rgba(225, 225, 225, .12); --app-header-background-color: #111111; --app-header-text-color: #e1e1e1;
+    --app-header-border-bottom: 1px solid rgba(225, 225, 225, .12);
+  }
+  html, body { margin: 0; background: var(--primary-background-color); }
+  .preview-bar { margin: 8px 16px; width: fit-content; font: 13px var(--ha-font-family-body);
+    background: var(--card-background-color); color: var(--primary-text-color); border: 1px solid var(--divider-color);
+    border-radius: 8px; padding: 6px 10px; display: flex; gap: 10px; align-items: center; }
+  .preview-bar button { font: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="preview-bar">Standalone preview (stub hass)
+  <button id="theme" type="button">Toggle dark</button>
+  <label><input id="narrow" type="checkbox"> Narrow</label>
+</div>
+
+<!-- Inlined copy of data/profiles.json. prototype/levels.py rewrites this block. -->
+<script id="profiles" type="application/json">
+{"footer": "Automated check of this release. Not a security review by the Open Home Foundation.", "levels": [], "samples": [], "integrations": [], "note": "Run prototype/levels.py to fill this preview with scan results."}
+</script>
+
+<!-- The same panel code HA loads, as a classic script so it works from file:// -->
+<script src="custom_components/access_profile/frontend/access-profile-panel.js"></script>
+<script>
+  const DATA = JSON.parse(document.getElementById("profiles").textContent);
+  const stubHass = {
+    language: "en",
+    themes: { darkMode: false },
+    callApi: async (method, path) => {
+      if (method === "GET" && path === "access_profile/profiles") return DATA;
+      throw new Error("Not available in preview: " + path);
+    },
+  };
+  const panel = document.createElement("access-profile-panel");
+  panel.narrow = false;
+  panel.hass = stubHass;
+  document.body.appendChild(panel);
+
+  const root = document.documentElement;
+  if (matchMedia("(prefers-color-scheme: dark)").matches) root.dataset.theme = "dark";
+  document.getElementById("theme").addEventListener("click", () => {
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  });
+  document.getElementById("narrow").addEventListener("change", (e) => { panel.narrow = e.target.checked; });
+  panel.addEventListener("hass-toggle-menu", () => alert("In HA this opens the sidebar."));
+</script>
+</body>
+</html>

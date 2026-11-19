@@ -24,7 +24,7 @@ PANEL_URL = "access-profile"
 STATIC_URL = "/access_profile_static"
 JS_FILE = "access-profile-panel.js"
 SIGNAL_JS = "marketplace-signal.js"
-VERSION = "0.2.2"  # cache-buster for the JS modules
+VERSION = "0.2.3"  # cache-buster for the JS modules
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
